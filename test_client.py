@@ -3,7 +3,7 @@ Solana Crowdfunding Platform - Python Test Client
 
 This client demonstrates how to interact with the crowdfunding smart contract.
 
-Program ID: CrwdN8ruKmWC3uxRWD9LU1RqoT4V3WQ3iRCJ5rRDxS3q
+Program ID: 3Dc6ZJsWiQm6CmDUt5MY4izbdLgpBU2KbhfSmqpVcayM
 
 Usage:
 1. pip install solders solana
@@ -22,7 +22,7 @@ import base64
 import time
 
 # Program ID
-PROGRAM_ID = Pubkey.from_string("CrwdN8ruKmWC3uxRWD9LU1RqoT4V3WQ3iRCJ5rRDxS3q")
+PROGRAM_ID = Pubkey.from_string("3Dc6ZJsWiQm6CmDUt5MY4izbdLgpBU2KbhfSmqpVcayM")
 
 # RPC endpoint
 RPC_URL = "https://api.devnet.solana.com"
