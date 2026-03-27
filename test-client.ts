@@ -22,7 +22,7 @@ import {
 import * as Buffer from "buffer";
 
 // Program ID
-const PROGRAM_ID = new PublicKey("CrwdN8ruKmWC3uxRWD9LU1RqoT4V3WQ3iRCJ5rRDxS3q");
+const PROGRAM_ID = new PublicKey("3Dc6ZJsWiQm6CmDUt5MY4izbdLgpBU2KbhfSmqpVcayM");
 
 // Connection to devnet
 const connection = new Connection("https://api.devnet.solana.com", "confirmed");
