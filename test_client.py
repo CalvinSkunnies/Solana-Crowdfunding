@@ -14,7 +14,8 @@ Note: You need SOL in your wallet to run tests on devnet.
 
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.transaction import Transaction, TransactionInstruction
+from solders.transaction import Transaction
+from solders.instruction import Instruction as TransactionInstruction
 from solders import system_program
 from solana.rpc.api import Client
 from solana.rpc.commitment import Confirmed
