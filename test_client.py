@@ -29,6 +29,7 @@ is below 0.5 SOL.
 import argparse
 import json
 import os
+import re
 import struct
 import sys
 import time
@@ -245,9 +246,12 @@ def ix_refund(donor, campaign, amount):
 
 def send_tx(client, instructions, signers, label="tx"):
     """
-    Build and send a versioned transaction.
+    Build and send a transaction.
     signers[0] is the fee payer.
     Returns the signature string on success, None on failure.
+
+    FIX: On failure, parses and prints the on-chain program logs so you
+    can see the real error reason (e.g. CampaignActive, AlreadyClaimed).
     """
     blockhash = client.get_latest_blockhash(commitment=Confirmed).value.blockhash
     msg = Message.new_with_blockhash(
@@ -268,12 +272,31 @@ def send_tx(client, instructions, signers, label="tx"):
         print(f"           Explorer: https://explorer.solana.com/tx/{sig}?cluster=devnet")
         return sig
     except Exception as e:
-        print(f"  [{label}] FAILED: {e}")
+        err_str = str(e)
+        print(f"  [{label}] FAILED: {err_str}")
+        # Extract and print on-chain program logs for easier debugging
+        if "logs" in err_str.lower():
+            try:
+                logs = re.findall(r'Program log: (.*?)(?:\\n|")', err_str)
+                if logs:
+                    print(f"  [{label}] On-chain program logs:")
+                    for log in logs:
+                        print(f"    >> {log}")
+            except Exception:
+                pass
         return None
 
 
-def wait_confirm(client, sig, timeout=60):  # was 30
-    """Poll for transaction confirmation. Returns True if confirmed."""
+def wait_confirm(client, sig, timeout=60):
+    """
+    Poll for transaction confirmation. Returns True if confirmed.
+
+    FIX 1: Timeout extended from 30s → 60s to handle slow Devnet slots.
+    FIX 2: confirmation_status is a solders enum, not a plain string.
+            We convert it with str() and use 'in' instead of == to avoid
+            silent mismatches (e.g. TransactionConfirmationStatus.Confirmed
+            would never equal the string "confirmed").
+    """
     if not sig:
         return False
     for i in range(timeout):
@@ -282,15 +305,57 @@ def wait_confirm(client, sig, timeout=60):  # was 30
             status = client.get_signature_statuses([sig]).value[0]
             if status is not None:
                 cs = status.confirmation_status
-                # solders returns an enum — compare via str() or .name
+                # Convert enum to lowercase string for safe comparison
                 cs_str = str(cs).lower() if cs else ""
                 if "confirmed" in cs_str or "finalized" in cs_str:
                     return True
         except Exception as e:
-            if i % 10 == 0:  # log every 10s, not every second
-                print(f"  Polling... ({e})")
-    print(f"  WARNING: Timed out waiting for confirmation")
+            # Log polling errors every 10s so the console isn't spammed
+            if i % 10 == 0:
+                print(f"  Polling ({i}s elapsed)... ({e})")
+    print(f"  WARNING: Timed out waiting for confirmation after {timeout}s")
     return False
+
+
+def check_tx_status(client, sig):
+    """
+    NEW: Fetch the full transaction result from the RPC and print its
+    outcome + program logs. Call this whenever wait_confirm returns False
+    so you can tell the difference between:
+      - TX confirmed on-chain but client timed out polling  (happy path)
+      - TX landed but the program rejected it               (on-chain error)
+      - TX genuinely not yet processed                      (retry / give up)
+    """
+    if not sig:
+        return
+    print(f"  Checking on-chain status for: {sig}")
+    try:
+        result = client.get_transaction(
+            sig,
+            max_supported_transaction_version=0,
+            commitment=Confirmed,
+        )
+        if result.value is None:
+            print("  TX not found on-chain yet — Devnet may still be processing.")
+            return
+
+        meta = result.value.transaction.meta
+        if meta is None:
+            print("  TX found but metadata unavailable.")
+            return
+
+        if meta.err:
+            print(f"  TX landed but FAILED on-chain: {meta.err}")
+        else:
+            print(f"  TX confirmed on-chain ✓  (fee: {meta.fee} lamports)")
+
+        if meta.log_messages:
+            print("  Program logs:")
+            for log in meta.log_messages:
+                print(f"    >> {log}")
+
+    except Exception as e:
+        print(f"  Status check error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -310,39 +375,70 @@ def test_success_scenario(client, wallet):
     print(f"      Goal:     {goal / 1e9} SOL")
     print(f"      Deadline: {deadline} (~20 seconds from now)")
     print(f"      Campaign: {campaign_kp.pubkey()}")
-    sig = send_tx(client, [ix_create_campaign(wallet.pubkey(), campaign_kp.pubkey(), goal, deadline)],
-                  [wallet, campaign_kp], "create_campaign")
+    sig = send_tx(
+        client,
+        [ix_create_campaign(wallet.pubkey(), campaign_kp.pubkey(), goal, deadline)],
+        [wallet, campaign_kp],
+        "create_campaign",
+    )
     if not wait_confirm(client, sig):
-        print("      Not confirmed — aborting scenario.")
+        # FIX: Instead of blindly aborting, check what actually happened on-chain.
+        # The TX may have confirmed after our polling window — fetch the real status.
+        print("  Confirmation polling timed out — fetching on-chain status...")
+        check_tx_status(client, sig)
+        print("  Giving Devnet 10 more seconds then retrying status check...")
+        time.sleep(10)
+        check_tx_status(client, sig)
+        print("  Aborting scenario 1. Check the Explorer link above for details.")
         return
 
     print("\n[2/7] Contribute 0.07 SOL")
-    sig = send_tx(client, [ix_contribute(wallet.pubkey(), campaign_kp.pubkey(), 70_000_000)],
-                  [wallet], "contribute_1")
+    sig = send_tx(
+        client,
+        [ix_contribute(wallet.pubkey(), campaign_kp.pubkey(), 70_000_000)],
+        [wallet],
+        "contribute_1",
+    )
     wait_confirm(client, sig)
 
     print("\n[3/7] Contribute 0.05 SOL  (total 0.12 SOL > 0.1 SOL goal)")
-    sig = send_tx(client, [ix_contribute(wallet.pubkey(), campaign_kp.pubkey(), 50_000_000)],
-                  [wallet], "contribute_2")
+    sig = send_tx(
+        client,
+        [ix_contribute(wallet.pubkey(), campaign_kp.pubkey(), 50_000_000)],
+        [wallet],
+        "contribute_2",
+    )
     wait_confirm(client, sig)
 
     print("\n[4/7] Withdraw BEFORE deadline (expected: CampaignActive error ✗)")
-    sig = send_tx(client, [ix_withdraw(wallet.pubkey(), campaign_kp.pubkey())],
-                  [wallet], "early_withdraw")
+    sig = send_tx(
+        client,
+        [ix_withdraw(wallet.pubkey(), campaign_kp.pubkey())],
+        [wallet],
+        "early_withdraw",
+    )
     print("      " + ("UNEXPECTED: succeeded" if sig else "Correct: rejected ✓"))
 
     print("\n[5/7] Waiting for deadline (20s)...")
     time.sleep(23)
 
     print("\n[6/7] Withdraw after deadline (expected: success ✓)")
-    sig = send_tx(client, [ix_withdraw(wallet.pubkey(), campaign_kp.pubkey())],
-                  [wallet], "withdraw")
+    sig = send_tx(
+        client,
+        [ix_withdraw(wallet.pubkey(), campaign_kp.pubkey())],
+        [wallet],
+        "withdraw",
+    )
     wait_confirm(client, sig)
     print("      " + ("Withdraw succeeded ✓" if sig else "UNEXPECTED: failed"))
 
     print("\n[7/7] Withdraw again (expected: AlreadyClaimed error ✗)")
-    sig = send_tx(client, [ix_withdraw(wallet.pubkey(), campaign_kp.pubkey())],
-                  [wallet], "double_withdraw")
+    sig = send_tx(
+        client,
+        [ix_withdraw(wallet.pubkey(), campaign_kp.pubkey())],
+        [wallet],
+        "double_withdraw",
+    )
     print("      " + ("UNEXPECTED: succeeded" if sig else "Correct: rejected ✓"))
 
     print("\n[Scenario 1 done]")
@@ -364,29 +460,51 @@ def test_refund_scenario(client, wallet):
     print(f"\n[1/5] Create campaign")
     print(f"      Goal:     {goal / 1e9} SOL (we will only contribute 0.05 SOL)")
     print(f"      Campaign: {campaign_kp.pubkey()}")
-    sig = send_tx(client, [ix_create_campaign(wallet.pubkey(), campaign_kp.pubkey(), goal, deadline)],
-                  [wallet, campaign_kp], "create_campaign")
+    sig = send_tx(
+        client,
+        [ix_create_campaign(wallet.pubkey(), campaign_kp.pubkey(), goal, deadline)],
+        [wallet, campaign_kp],
+        "create_campaign",
+    )
     if not wait_confirm(client, sig):
-        print("      Not confirmed — aborting scenario.")
+        # FIX: Same as scenario 1 — diagnose before aborting.
+        print("  Confirmation polling timed out — fetching on-chain status...")
+        check_tx_status(client, sig)
+        print("  Giving Devnet 10 more seconds then retrying status check...")
+        time.sleep(10)
+        check_tx_status(client, sig)
+        print("  Aborting scenario 2. Check the Explorer link above for details.")
         return
 
     contrib = 50_000_000   # 0.05 SOL
     print(f"\n[2/5] Contribute 0.05 SOL (far below 0.5 SOL goal)")
-    sig = send_tx(client, [ix_contribute(wallet.pubkey(), campaign_kp.pubkey(), contrib)],
-                  [wallet], "contribute")
+    sig = send_tx(
+        client,
+        [ix_contribute(wallet.pubkey(), campaign_kp.pubkey(), contrib)],
+        [wallet],
+        "contribute",
+    )
     wait_confirm(client, sig)
 
     print("\n[3/5] Try withdraw before deadline (expected: CampaignActive error ✗)")
-    sig = send_tx(client, [ix_withdraw(wallet.pubkey(), campaign_kp.pubkey())],
-                  [wallet], "early_withdraw")
+    sig = send_tx(
+        client,
+        [ix_withdraw(wallet.pubkey(), campaign_kp.pubkey())],
+        [wallet],
+        "early_withdraw",
+    )
     print("      " + ("UNEXPECTED: succeeded" if sig else "Correct: rejected ✓"))
 
     print("\n[4/5] Waiting for deadline (20s)...")
     time.sleep(23)
 
     print("\n[5/5] Refund 0.05 SOL (expected: success ✓)")
-    sig = send_tx(client, [ix_refund(wallet.pubkey(), campaign_kp.pubkey(), contrib)],
-                  [wallet], "refund")
+    sig = send_tx(
+        client,
+        [ix_refund(wallet.pubkey(), campaign_kp.pubkey(), contrib)],
+        [wallet],
+        "refund",
+    )
     wait_confirm(client, sig)
     print("      " + ("Refund succeeded ✓" if sig else "UNEXPECTED: failed"))
 
