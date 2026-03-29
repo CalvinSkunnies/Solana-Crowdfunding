@@ -184,7 +184,7 @@ def get_balance_sol(client: Client, pubkey: Pubkey) -> float:
     return client.get_balance(pubkey, commitment=Confirmed).value / LAMPORTS_PER_SOL
  
  
-def ensure_funded(client: Client, pubkey: Pubkey, min_sol: float = 2.0):
+def ensure_funded(client: Client, pubkey: Pubkey, min_sol: float = 1.0):
     balance = get_balance_sol(client, pubkey)
     print(f"Wallet balance : {balance:.4f} SOL")
     if balance >= min_sol:
