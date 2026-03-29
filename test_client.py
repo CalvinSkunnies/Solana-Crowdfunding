@@ -272,18 +272,23 @@ def send_tx(client, instructions, signers, label="tx"):
         return None
 
 
-def wait_confirm(client, sig, timeout=30):
+def wait_confirm(client, sig, timeout=60):  # was 30
     """Poll for transaction confirmation. Returns True if confirmed."""
     if not sig:
         return False
-    for _ in range(timeout):
+    for i in range(timeout):
         time.sleep(1)
         try:
             status = client.get_signature_statuses([sig]).value[0]
-            if status and status.confirmation_status in ("confirmed", "finalized"):
-                return True
-        except Exception:
-            pass
+            if status is not None:
+                cs = status.confirmation_status
+                # solders returns an enum — compare via str() or .name
+                cs_str = str(cs).lower() if cs else ""
+                if "confirmed" in cs_str or "finalized" in cs_str:
+                    return True
+        except Exception as e:
+            if i % 10 == 0:  # log every 10s, not every second
+                print(f"  Polling... ({e})")
     print(f"  WARNING: Timed out waiting for confirmation")
     return False
 
