@@ -45,7 +45,7 @@ impl From<CrowdfundingError> for ProgramError {
 }
 
 /// Program ID
-solana_program::declare_id!("7WtjtH7Npr8m1VAmeMEEbiWaujt17yt3Yja58KrRupoQ");
+solana_program::declare_id!("3Dc6ZJsWiQm6CmDUt5MY4izbdLgpBU2KbhfSmqpVcayM");
 
 /// Main processing function
 pub fn process_instruction(
