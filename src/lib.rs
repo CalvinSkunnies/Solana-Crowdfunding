@@ -15,12 +15,13 @@ use solana_program::{
 /// Data structure for a campaign
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct Campaign {
-    pub creator: Pubkey,      // Who created this
-    pub goal: u64,            // Target amount in lamports
-    pub raised: u64,          // Current amount raised
-    pub deadline: i64,        // When campaign ends (Unix timestamp)
-    pub claimed: bool,        // Already withdrawn?
-    pub bump: u8,             // PDA bump for vault
+    pub creator: Pubkey,      // 32 bytes
+    pub goal: u64,            //  8 bytes
+    pub raised: u64,          //  8 bytes
+    pub deadline: i64,        //  8 bytes
+    pub claimed: bool,        //  1 byte
+    pub bump: u8,             //  1 byte
+    // Total Borsh size: 58 bytes
 }
 
 /// Error codes
@@ -101,7 +102,6 @@ pub fn process_instruction(
 }
 
 /// Create a new campaign
-#[allow(clippy::unnecessary_warnings)]
 fn create_campaign(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -110,40 +110,37 @@ fn create_campaign(
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
 
-    // Creator account (signer)
-    let creator = next_account_info(accounts_iter)?;
+    let creator         = next_account_info(accounts_iter)?;
+    let campaign_account = next_account_info(accounts_iter)?;
+    let system_program  = next_account_info(accounts_iter)?;
+    let rent            = next_account_info(accounts_iter)?;
+
     if !creator.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Campaign account (to be created)
-    let campaign_account = next_account_info(accounts_iter)?;
-
-    // System program
-    let system_program = next_account_info(accounts_iter)?;
-
-    // Rent sysvar
-    let rent = next_account_info(accounts_iter)?;
-
-    // Validate deadline is in the future
     let clock = Clock::get()?;
     if deadline <= clock.unix_timestamp {
         msg!("Error: Deadline must be in the future");
         return Err(CrowdfundingError::DeadlineInPast.into());
     }
 
-    // Derive vault PDA
     let (vault_pda, bump) = Pubkey::find_program_address(
         &[b"vault", campaign_account.key.as_ref()],
         program_id,
     );
 
-    // Calculate rent for campaign account
-    let campaign_data_len = 8 + 32 + 8 + 8 + 8 + 1 + 1; // fields
+    // FIX: correct Borsh size for Campaign struct:
+    //   creator(32) + goal(8) + raised(8) + deadline(8) + claimed(1) + bump(1) = 58
+    // The old code used 8+32+8+8+8+1+1 = 66, treating the leading 8 as an
+    // Anchor-style discriminator — but this is a native program. Borsh writes
+    // exactly 58 bytes. Allocating 66 left 8 garbage bytes at the end, causing
+    // every subsequent try_from_slice to fail with BorshIoError.
+    let campaign_data_len = 32 + 8 + 8 + 8 + 1 + 1; // = 58
+
     let rent_data = Rent::from_account_info(rent)?;
     let rent_exempt_minimum = rent_data.minimum_balance(campaign_data_len);
 
-    // Create campaign account
     invoke(
         &system_instruction::create_account(
             creator.key,
@@ -159,7 +156,6 @@ fn create_campaign(
         ],
     )?;
 
-    // Initialize campaign data
     let campaign = Campaign {
         creator: *creator.key,
         goal,
@@ -178,7 +174,6 @@ fn create_campaign(
 }
 
 /// Contribute to a campaign
-#[allow(clippy::unnecessary_warnings)]
 fn contribute(
     _program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -186,29 +181,23 @@ fn contribute(
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
 
-    // Donor account (signer)
-    let donor = next_account_info(accounts_iter)?;
+    let donor            = next_account_info(accounts_iter)?;
+    let campaign_account = next_account_info(accounts_iter)?;
+    let system_program   = next_account_info(accounts_iter)?;
+
     if !donor.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Campaign account
-    let campaign_account = next_account_info(accounts_iter)?;
-
-    // System program
-    let system_program = next_account_info(accounts_iter)?;
-
-    // Get campaign data
     let mut campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
 
-    // Check campaign hasn't ended
     let clock = Clock::get()?;
     if clock.unix_timestamp >= campaign.deadline {
         msg!("Error: Campaign has ended");
         return Err(CrowdfundingError::CampaignEnded.into());
     }
 
-    // Transfer SOL from donor to campaign (using campaign as vault)
+    // Campaign account itself holds the funds (it is the vault)
     invoke(
         &system_instruction::transfer(donor.key, campaign_account.key, amount),
         &[
@@ -218,85 +207,66 @@ fn contribute(
         ],
     )?;
 
-    // Update raised amount
     campaign.raised = campaign
         .raised
         .checked_add(amount)
         .ok_or(ProgramError::ArithmeticOverflow)?;
 
-    // Serialize back
     campaign.serialize(&mut &mut campaign_account.data.borrow_mut()[..])?;
 
-    msg!(
-        "Contributed: {} lamports, total={}",
-        amount,
-        campaign.raised
-    );
+    msg!("Contributed: {} lamports, total={}", amount, campaign.raised);
 
     Ok(())
 }
 
 /// Withdraw funds (creator only, after deadline, if goal reached)
-#[allow(clippy::unnecessary_warnings)]
 fn withdraw(
     _program_id: &Pubkey,
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
 
-    // Creator account (signer)
-    let creator = next_account_info(accounts_iter)?;
+    let creator          = next_account_info(accounts_iter)?;
+    let campaign_account = next_account_info(accounts_iter)?;
+
     if !creator.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Campaign account (also acts as vault)
-    let campaign_account = next_account_info(accounts_iter)?;
-
-    // Get campaign data
     let mut campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
 
-    // Verify caller is creator
     if campaign.creator != *creator.key {
         msg!("Error: Not the campaign creator");
         return Err(CrowdfundingError::NotCreator.into());
     }
 
-    // Check deadline has passed
     let clock = Clock::get()?;
     if clock.unix_timestamp < campaign.deadline {
         msg!("Error: Campaign still active");
         return Err(CrowdfundingError::CampaignActive.into());
     }
 
-    // Check goal reached
     if campaign.raised < campaign.goal {
         msg!("Error: Campaign goal not reached");
         return Err(CrowdfundingError::GoalNotReached.into());
     }
 
-    // Check not already claimed
     if campaign.claimed {
         msg!("Error: Already claimed");
         return Err(CrowdfundingError::AlreadyClaimed.into());
     }
 
-    // Calculate amount to withdraw
-    let amount = campaign.raised;
-
-    // Transfer all funds from campaign (vault) to creator
+    let amount           = campaign.raised;
     let campaign_lamports = **campaign_account.lamports.borrow();
-    let creator_lamports = **creator.lamports.borrow();
+    let creator_lamports  = **creator.lamports.borrow();
 
-    // Transfer lamports
     **campaign_account.lamports.borrow_mut() = 0;
     **creator.lamports.borrow_mut() = creator_lamports
         .checked_add(campaign_lamports)
         .ok_or(ProgramError::ArithmeticOverflow)?;
 
-    // Mark as claimed
     campaign.claimed = true;
-    campaign.raised = 0;
+    campaign.raised  = 0;
 
     campaign.serialize(&mut &mut campaign_account.data.borrow_mut()[..])?;
 
@@ -306,7 +276,6 @@ fn withdraw(
 }
 
 /// Refund (donors only, after deadline, if goal NOT reached)
-#[allow(clippy::unnecessary_warnings)]
 fn refund(
     _program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -314,39 +283,28 @@ fn refund(
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
 
-    // Donor account (signer)
-    let donor = next_account_info(accounts_iter)?;
-    if !donor.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-
-    // Campaign account
+    let donor            = next_account_info(accounts_iter)?;
     let campaign_account = next_account_info(accounts_iter)?;
 
-    // Get campaign data
     let campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
 
-    // Check deadline has passed
     let clock = Clock::get()?;
     if clock.unix_timestamp < campaign.deadline {
         msg!("Error: Campaign still active");
         return Err(CrowdfundingError::CampaignActive.into());
     }
 
-    // Check goal NOT reached
     if campaign.raised >= campaign.goal {
         msg!("Error: Campaign goal reached - cannot refund");
         return Err(CrowdfundingError::GoalReached.into());
     }
 
-    // Check campaign has funds to refund
     let campaign_lamports = **campaign_account.lamports.borrow();
     if campaign_lamports < amount {
         msg!("Error: Insufficient funds in campaign");
         return Err(CrowdfundingError::InsufficientFunds.into());
     }
 
-    // Transfer funds from campaign to donor
     **campaign_account.lamports.borrow_mut() = campaign_lamports
         .checked_sub(amount)
         .ok_or(ProgramError::ArithmeticOverflow)?;
