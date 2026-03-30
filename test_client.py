@@ -1,51 +1,5 @@
 """
-Solana Crowdfunding Platform - Python Test Client
-Repo: https://github.com/CalvinSkunnies/Solana-Crowdfunding
-
-ROOT CAUSE OF ALL FAILURES (diagnosed from lib.rs)
-────────────────────────────────────────────────────────────────
-The BorshIoError on every instruction was caused by a wrong account
-allocation size in create_campaign:
-
-  OLD (broken):  campaign_data_len = 8 + 32 + 8 + 8 + 8 + 1 + 1  = 66 bytes
-  NEW (correct): campaign_data_len =     32 + 8 + 8 + 8 + 1 + 1  = 58 bytes
-
-The leading `8` was an Anchor-style discriminator — this is a native
-Borsh program and has no discriminator. Borsh serializes Campaign as
-exactly 58 bytes. Allocating 66 left 8 uninitialized zero bytes at the
-end, and Campaign::try_from_slice() is strict: it errors if any bytes
-remain after deserialization → BorshIoError on every contribute/withdraw.
-
-ACCOUNT LAYOUTS (from lib.rs — no vault PDA needed in client calls)
-────────────────────────────────────────────────────────────────
-  CreateCampaign [0]: creator(signer,w), campaign(signer,w),
-                      system_program, rent_sysvar
-  Contribute     [1]: donor(signer,w), campaign(w), system_program
-  Withdraw       [2]: creator(signer,w), campaign(w)
-  Refund         [3]: donor(signer,w), campaign(w)
-
-The campaign account IS the vault — SOL is transferred directly into it.
-No separate vault PDA account is passed to any instruction.
-
-CHECKLIST
-────────────────────────────────────────────────────────────────
-1. Create campaign  goal=0.1 SOL, deadline=45s (or 24h --long-deadline)
-2. Contribute 0.06 SOL  →  raised = 0.06 SOL
-3. Contribute 0.05 SOL  →  raised = 0.11 SOL  (exceeds goal)
-4. Withdraw BEFORE deadline  →  must FAIL  (CampaignActive)
-5. Wait for deadline, withdraw  →  must SUCCEED
-6. Withdraw again  →  must FAIL  (AlreadyClaimed)
-
-IMPORTANT: You must redeploy lib.rs before running this client.
-The fix is in lib.rs (campaign_data_len = 58, not 66).
-See instructions at the bottom of this file.
-
-Usage:
-    pip install solders solana
-    python test_client.py
-    python test_client.py --keypair /path/to/id.json
-    python test_client.py --new-wallet
-    python test_client.py --long-deadline
+I think still no PDA vault here (will be updated next)
 """
 
 import argparse
