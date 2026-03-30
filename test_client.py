@@ -74,7 +74,7 @@ from solana.rpc.types import TxOpts
 # Configuration
 # =============================================================================
 
-PROGRAM_ID       = Pubkey.from_string("3Dc6ZJsWiQm6CmDUt5MY4izbdLgpBU2KbhfSmqpVcayM")
+PROGRAM_ID       = Pubkey.from_string("7WtjtH7Npr8m1VAmeMEEbiWaujt17yt3Yja58KrRupoQ")
 RPC_URL          = "https://api.devnet.solana.com"
 RENT_SYSVAR      = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
 LAMPORTS_PER_SOL = 1_000_000_000
