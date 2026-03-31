@@ -10,6 +10,7 @@ use solana_program::{
     pubkey::Pubkey,
     rent::Rent,
     system_instruction,
+    system_program,
     sysvar::Sysvar,
 };
 
@@ -17,66 +18,68 @@ use solana_program::{
 // Data structures
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Campaign state stored in the campaign account.
-///
-/// Borsh layout (58 bytes):
-///   creator   Pubkey   32
-///   goal      u64       8
-///   raised    u64       8
-///   deadline  i64       8
-///   claimed   bool      1
-///   bump      u8        1
-///                      ──
-///                      58
+/// Campaign state (Borsh, 58 bytes).
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct Campaign {
-    pub creator:  Pubkey,
-    pub goal:     u64,
-    pub raised:   u64,
-    pub deadline: i64,
-    pub claimed:  bool,
-    pub bump:     u8,   // vault PDA bump seed — stored so withdraw/refund never re-derive
+    pub creator:  Pubkey,   // 32
+    pub goal:     u64,      //  8
+    pub raised:   u64,      //  8
+    pub deadline: i64,      //  8
+    pub claimed:  bool,     //  1
+    pub bump:     u8,       //  1   vault PDA bump
+}
+impl Campaign {
+    pub const LEN: usize = 32 + 8 + 8 + 8 + 1 + 1; // 58
 }
 
-impl Campaign {
-    /// Exact serialised size (no Anchor discriminator — native program).
-    pub const LEN: usize = 32 + 8 + 8 + 8 + 1 + 1; // = 58
+/// Per-donor contribution receipt — stored in a separate PDA per (campaign, donor).
+///
+/// Borsh layout (40 bytes):
+///   donor    Pubkey  32
+///   amount   u64      8
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct Contribution {
+    pub donor:  Pubkey, // 32
+    pub amount: u64,    //  8
+}
+impl Contribution {
+    pub const LEN: usize = 32 + 8; // 40
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Error codes
+// Errors
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrowdfundingError {
-    DeadlineInPast    = 0,
-    CampaignEnded     = 1,
-    GoalNotReached    = 2,
-    GoalReached       = 3,
-    AlreadyClaimed    = 4,
-    NotCreator        = 5,
-    CampaignActive    = 6,
-    InvalidAccount    = 7,
-    InsufficientFunds = 8,
+    DeadlineInPast      = 0,
+    CampaignEnded       = 1,
+    GoalNotReached      = 2,
+    GoalReached         = 3,
+    AlreadyClaimed      = 4,
+    NotCreator          = 5,
+    CampaignActive      = 6,
+    InvalidAccount      = 7,
+    InsufficientFunds   = 8,
+    AccountNotWritable  = 9,
+    NoContributionFound = 10,
+    RefundExceedsAmount = 11,
 }
-
 impl From<CrowdfundingError> for ProgramError {
-    fn from(e: CrowdfundingError) -> Self {
-        ProgramError::Custom(e as u32)
-    }
+    fn from(e: CrowdfundingError) -> Self { ProgramError::Custom(e as u32) }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Program ID — update this after every fresh deployment
+// Program ID
 // ─────────────────────────────────────────────────────────────────────────────
 
 solana_program::declare_id!("DKsRhfniEEv3EcNgvbid11aDAAC3Mbsxui3rTQnU5GS3");
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Entrypoint
-// ─────────────────────────────────────────────────────────────────────────────
-
 solana_program::entrypoint!(process_instruction);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dispatch
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub fn process_instruction(
     program_id:       &Pubkey,
@@ -86,7 +89,6 @@ pub fn process_instruction(
     if instruction_data.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
-
     match instruction_data[0] {
         0 => {
             if instruction_data.len() < 17 {
@@ -104,39 +106,68 @@ pub fn process_instruction(
             contribute(program_id, accounts, amount)
         }
         2 => withdraw(program_id, accounts),
-        3 => {
-            if instruction_data.len() < 9 {
-                return Err(ProgramError::InvalidInstructionData);
-            }
-            let amount = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
-            refund(program_id, accounts, amount)
-        }
+        3 => refund(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper — derive vault PDA
-// Seeds: [b"vault", campaign_pubkey]
+// PDA helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn find_vault_pda(campaign_key: &Pubkey, program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"vault", campaign_key.as_ref()], program_id)
+}
+
+fn find_contribution_pda(
+    campaign_key: &Pubkey,
+    donor_key:    &Pubkey,
+    program_id:   &Pubkey,
+) -> (Pubkey, u8) {
     Pubkey::find_program_address(
-        &[b"vault", campaign_key.as_ref()],
+        &[b"contribution", campaign_key.as_ref(), donor_key.as_ref()],
         program_id,
     )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Validation helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Verify account is writable.
+fn require_writable(account: &AccountInfo) -> ProgramResult {
+    if !account.is_writable {
+        msg!("Error: Account {} must be writable", account.key);
+        return Err(CrowdfundingError::AccountNotWritable.into());
+    }
+    Ok(())
+}
+
+/// Verify account owner matches expected program.
+fn require_owner(account: &AccountInfo, expected: &Pubkey) -> ProgramResult {
+    if account.owner != expected {
+        msg!(
+            "Error: Account {} owner {} != expected {}",
+            account.key, account.owner, expected
+        );
+        return Err(CrowdfundingError::InvalidAccount.into());
+    }
+    Ok(())
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Instruction 0 — CreateCampaign
 //
-// Account layout:
-//   0  creator          signer, writable   pays all rent
-//   1  campaign         signer, writable   new account — owned by this program
-//   2  vault            writable           PDA ["vault", campaign] — new account
+// Accounts:
+//   0  creator          signer, writable
+//   1  campaign         signer, writable   (new, program-owned)
+//   2  vault            writable           (PDA, system-owned)
 //   3  system_program
-//   4  rent_sysvar
-// ─────────────────────────────────────────────────────────────────────────────
+//
+// NOTE: rent_sysvar REMOVED — we use Rent::get() instead (non-deprecated).
+// NOTE: Vault is initialised via transfer + assign instead of create_account
+//       to prevent the pre-funding attack (AccountAlreadyInitialized).
+// ═════════════════════════════════════════════════════════════════════════════
 
 fn create_campaign(
     program_id: &Pubkey,
@@ -149,12 +180,13 @@ fn create_campaign(
     let creator          = next_account_info(iter)?;
     let campaign_account = next_account_info(iter)?;
     let vault_account    = next_account_info(iter)?;
-    let system_program   = next_account_info(iter)?;
-    let rent_sysvar      = next_account_info(iter)?;
+    let sys_program      = next_account_info(iter)?;
 
     if !creator.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+    require_writable(campaign_account)?;
+    require_writable(vault_account)?;
 
     // Deadline must be in the future
     let clock = Clock::get()?;
@@ -163,16 +195,17 @@ fn create_campaign(
         return Err(CrowdfundingError::DeadlineInPast.into());
     }
 
-    // Derive vault PDA and verify caller supplied the correct address
+    // Derive + verify vault PDA
     let (vault_pda, bump) = find_vault_pda(campaign_account.key, program_id);
     if vault_pda != *vault_account.key {
         msg!("Error: Vault PDA mismatch");
         return Err(CrowdfundingError::InvalidAccount.into());
     }
 
-    let rent = Rent::from_account_info(rent_sysvar)?;
+    // FIX: Use Rent::get() instead of deprecated Rent::from_account_info
+    let rent = Rent::get()?;
 
-    // ── Create campaign account (program-owned, stores Campaign state) ────────
+    // ── Create campaign account ───────────────────────────────────────────────
     invoke(
         &system_instruction::create_account(
             creator.key,
@@ -181,51 +214,61 @@ fn create_campaign(
             Campaign::LEN as u64,
             program_id,
         ),
-        &[creator.clone(), campaign_account.clone(), system_program.clone()],
+        &[creator.clone(), campaign_account.clone(), sys_program.clone()],
     )?;
 
-    // ── Create vault account (system-owned PDA, stores SOL donations) ─────────
-    // Zero data — it only holds lamports.  The program signs for it via PDA.
+    // ── Initialise vault PDA (pre-fund-safe) ─────────────────────────────────
+    // Instead of create_account (which fails if PDA is already funded by an
+    // attacker), we: (1) transfer rent-exempt minimum, (2) allocate 0 bytes,
+    // (3) assign to system program.  Steps 2+3 are no-ops on a fresh PDA but
+    // succeed even if the PDA already has lamports (no AccountAlreadyInitialized).
+    let vault_rent = rent.minimum_balance(0);
+    let current    = vault_account.lamports();
+
+    if current < vault_rent {
+        let deficit = vault_rent - current;
+        invoke_signed(
+            &system_instruction::transfer(creator.key, vault_account.key, deficit),
+            &[creator.clone(), vault_account.clone(), sys_program.clone()],
+            &[&[b"vault", campaign_account.key.as_ref(), &[bump]]],
+        )?;
+    }
+    // allocate(0) + assign(system_program) — idempotent, safe if already init
     invoke_signed(
-        &system_instruction::create_account(
-            creator.key,
-            vault_account.key,
-            rent.minimum_balance(0),
-            0,
-            &solana_program::system_program::id(),
-        ),
-        &[creator.clone(), vault_account.clone(), system_program.clone()],
+        &system_instruction::allocate(vault_account.key, 0),
+        &[vault_account.clone(), sys_program.clone()],
+        &[&[b"vault", campaign_account.key.as_ref(), &[bump]]],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(vault_account.key, &system_program::id()),
+        &[vault_account.clone(), sys_program.clone()],
         &[&[b"vault", campaign_account.key.as_ref(), &[bump]]],
     )?;
 
     // ── Persist campaign state ────────────────────────────────────────────────
     let campaign = Campaign {
-        creator:  *creator.key,
-        goal,
-        raised:   0,
-        deadline,
-        claimed:  false,
-        bump,
+        creator: *creator.key, goal, raised: 0, deadline, claimed: false, bump,
     };
     campaign.serialize(&mut &mut campaign_account.data.borrow_mut()[..])?;
 
     msg!("Campaign created: goal={}, deadline={}", goal, deadline);
     msg!("Vault PDA: {}", vault_pda);
-
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
 // Instruction 1 — Contribute
 //
-// SOL flows: donor → vault PDA (NOT into the campaign account).
-//
-// Account layout:
+// Accounts:
 //   0  donor            signer, writable
-//   1  campaign         writable           raised counter update
-//   2  vault            writable           PDA — receives the SOL
-//   3  system_program
-// ─────────────────────────────────────────────────────────────────────────────
+//   1  campaign         writable           (owner = this program — validated)
+//   2  vault            writable           PDA
+//   3  contribution     writable           PDA ["contribution", campaign, donor]
+//   4  system_program
+//
+// Per-donor contribution tracking: a Contribution PDA is created on first
+// donation and updated (amount += new_amount) on subsequent ones.
+// ═════════════════════════════════════════════════════════════════════════════
 
 fn contribute(
     program_id: &Pubkey,
@@ -237,11 +280,18 @@ fn contribute(
     let donor            = next_account_info(iter)?;
     let campaign_account = next_account_info(iter)?;
     let vault_account    = next_account_info(iter)?;
-    let system_program   = next_account_info(iter)?;
+    let contrib_account  = next_account_info(iter)?;
+    let sys_program      = next_account_info(iter)?;
 
     if !donor.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+    require_writable(campaign_account)?;
+    require_writable(vault_account)?;
+    require_writable(contrib_account)?;
+
+    // FIX: Validate campaign account is owned by this program
+    require_owner(campaign_account, program_id)?;
 
     // Verify vault PDA
     let (vault_pda, _) = find_vault_pda(campaign_account.key, program_id);
@@ -250,49 +300,82 @@ fn contribute(
         return Err(CrowdfundingError::InvalidAccount.into());
     }
 
+    // Verify contribution PDA
+    let (contrib_pda, contrib_bump) =
+        find_contribution_pda(campaign_account.key, donor.key, program_id);
+    if contrib_pda != *contrib_account.key {
+        msg!("Error: Contribution PDA mismatch");
+        return Err(CrowdfundingError::InvalidAccount.into());
+    }
+
     let mut campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
 
-    // Campaign must still be active
     let clock = Clock::get()?;
     if clock.unix_timestamp >= campaign.deadline {
         msg!("Error: Campaign has ended");
         return Err(CrowdfundingError::CampaignEnded.into());
     }
 
-    // Transfer SOL from donor → vault PDA
+    // ── Transfer SOL: donor → vault ──────────────────────────────────────────
     invoke(
         &system_instruction::transfer(donor.key, vault_account.key, amount),
-        &[donor.clone(), vault_account.clone(), system_program.clone()],
+        &[donor.clone(), vault_account.clone(), sys_program.clone()],
     )?;
 
-    // Update the raised counter
-    campaign.raised = campaign
-        .raised
+    // ── Update / create contribution PDA ─────────────────────────────────────
+    let contrib_seeds: &[&[u8]] = &[
+        b"contribution", campaign_account.key.as_ref(), donor.key.as_ref(), &[contrib_bump],
+    ];
+
+    if contrib_account.data_len() == 0 {
+        // First-time donor — create the contribution account
+        let rent = Rent::get()?;
+        invoke_signed(
+            &system_instruction::create_account(
+                donor.key,
+                contrib_account.key,
+                rent.minimum_balance(Contribution::LEN),
+                Contribution::LEN as u64,
+                program_id,
+            ),
+            &[donor.clone(), contrib_account.clone(), sys_program.clone()],
+            &[contrib_seeds],
+        )?;
+        let contribution = Contribution { donor: *donor.key, amount };
+        contribution.serialize(&mut &mut contrib_account.data.borrow_mut()[..])?;
+    } else {
+        // Returning donor — update existing
+        require_owner(contrib_account, program_id)?;
+        let mut contribution = Contribution::try_from_slice(&contrib_account.data.borrow())?;
+        if contribution.donor != *donor.key {
+            msg!("Error: Contribution account donor mismatch");
+            return Err(CrowdfundingError::InvalidAccount.into());
+        }
+        contribution.amount = contribution.amount
+            .checked_add(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        contribution.serialize(&mut &mut contrib_account.data.borrow_mut()[..])?;
+    }
+
+    // ── Update campaign raised counter ───────────────────────────────────────
+    campaign.raised = campaign.raised
         .checked_add(amount)
         .ok_or(ProgramError::ArithmeticOverflow)?;
     campaign.serialize(&mut &mut campaign_account.data.borrow_mut()[..])?;
 
     msg!("Contributed: {} lamports, total={}", amount, campaign.raised);
-
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
 // Instruction 2 — Withdraw
 //
-// Creator claims ALL vault funds after:
-//   • deadline has passed
-//   • raised >= goal
-//   • not already claimed
-//
-// Uses invoke_signed to transfer from vault PDA → creator.
-//
-// Account layout:
-//   0  creator          signer, writable   receives all vault SOL
-//   1  campaign         writable           claimed = true
-//   2  vault            writable           PDA — sends SOL
+// Accounts:
+//   0  creator          signer, writable
+//   1  campaign         writable           (owner = this program)
+//   2  vault            writable           PDA
 //   3  system_program
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
 
 fn withdraw(
     program_id: &Pubkey,
@@ -303,15 +386,17 @@ fn withdraw(
     let creator          = next_account_info(iter)?;
     let campaign_account = next_account_info(iter)?;
     let vault_account    = next_account_info(iter)?;
-    let system_program   = next_account_info(iter)?;
+    let sys_program      = next_account_info(iter)?;
 
     if !creator.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+    require_writable(campaign_account)?;
+    require_writable(vault_account)?;
+    require_owner(campaign_account, program_id)?;
 
     let mut campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
 
-    // Verify vault PDA (use stored bump so we never re-derive from scratch)
     let (vault_pda, _) = find_vault_pda(campaign_account.key, program_id);
     if vault_pda != *vault_account.key {
         msg!("Error: Vault PDA mismatch");
@@ -319,7 +404,6 @@ fn withdraw(
     }
     let bump = campaign.bump;
 
-    // Auth + state checks
     if campaign.creator != *creator.key {
         msg!("Error: Not the campaign creator");
         return Err(CrowdfundingError::NotCreator.into());
@@ -338,7 +422,6 @@ fn withdraw(
         return Err(CrowdfundingError::AlreadyClaimed.into());
     }
 
-    // Drain vault → creator
     let vault_lamports = **vault_account.lamports.borrow();
     if vault_lamports == 0 {
         msg!("Error: Vault is empty");
@@ -347,51 +430,52 @@ fn withdraw(
 
     invoke_signed(
         &system_instruction::transfer(vault_account.key, creator.key, vault_lamports),
-        &[vault_account.clone(), creator.clone(), system_program.clone()],
+        &[vault_account.clone(), creator.clone(), sys_program.clone()],
         &[&[b"vault", campaign_account.key.as_ref(), &[bump]]],
     )?;
 
-    // Mark claimed — prevents double-withdrawal
     campaign.claimed = true;
     campaign.raised  = 0;
     campaign.serialize(&mut &mut campaign_account.data.borrow_mut()[..])?;
 
     msg!("Withdrawn: {} lamports to creator", vault_lamports);
-
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
 // Instruction 3 — Refund
 //
-// Donor reclaims their contribution when:
-//   • deadline has passed
-//   • raised < goal
+// FIX: Refund amount is now determined by the on-chain Contribution PDA —
+// callers can no longer specify an arbitrary amount.
 //
-// Uses invoke_signed to transfer from vault PDA → donor.
-//
-// Account layout:
-//   0  donor            signer, writable   receives refund
-//   1  campaign         writable
-//   2  vault            writable           PDA — sends SOL
-//   3  system_program
-// ─────────────────────────────────────────────────────────────────────────────
+// Accounts:
+//   0  donor            signer, writable
+//   1  campaign         writable           (owner = this program)
+//   2  vault            writable           PDA
+//   3  contribution     writable           PDA ["contribution", campaign, donor]
+//   4  system_program
+// ═════════════════════════════════════════════════════════════════════════════
 
 fn refund(
     program_id: &Pubkey,
     accounts:   &[AccountInfo],
-    amount:     u64,
 ) -> ProgramResult {
     let iter = &mut accounts.iter();
 
     let donor            = next_account_info(iter)?;
     let campaign_account = next_account_info(iter)?;
     let vault_account    = next_account_info(iter)?;
-    let system_program   = next_account_info(iter)?;
+    let contrib_account  = next_account_info(iter)?;
+    let sys_program      = next_account_info(iter)?;
 
     if !donor.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+    require_writable(campaign_account)?;
+    require_writable(vault_account)?;
+    require_writable(contrib_account)?;
+    require_owner(campaign_account, program_id)?;
+    require_owner(contrib_account, program_id)?;
 
     let campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
 
@@ -402,6 +486,14 @@ fn refund(
         return Err(CrowdfundingError::InvalidAccount.into());
     }
     let bump = campaign.bump;
+
+    // Verify contribution PDA
+    let (contrib_pda, _) =
+        find_contribution_pda(campaign_account.key, donor.key, program_id);
+    if contrib_pda != *contrib_account.key {
+        msg!("Error: Contribution PDA mismatch");
+        return Err(CrowdfundingError::InvalidAccount.into());
+    }
 
     // State checks
     let clock = Clock::get()?;
@@ -414,20 +506,44 @@ fn refund(
         return Err(CrowdfundingError::GoalReached.into());
     }
 
+    // Read the donor's actual contribution — prevents arbitrary drain
+    let contribution = Contribution::try_from_slice(&contrib_account.data.borrow())?;
+    if contribution.donor != *donor.key {
+        msg!("Error: Contribution donor mismatch");
+        return Err(CrowdfundingError::InvalidAccount.into());
+    }
+    let refund_amount = contribution.amount;
+    if refund_amount == 0 {
+        msg!("Error: No contribution to refund");
+        return Err(CrowdfundingError::NoContributionFound.into());
+    }
+
     let vault_lamports = **vault_account.lamports.borrow();
-    if vault_lamports < amount {
+    if vault_lamports < refund_amount {
         msg!("Error: Insufficient funds in vault");
         return Err(CrowdfundingError::InsufficientFunds.into());
     }
 
-    // Refund donor from vault using invoke_signed
+    // Transfer refund from vault → donor
     invoke_signed(
-        &system_instruction::transfer(vault_account.key, donor.key, amount),
-        &[vault_account.clone(), donor.clone(), system_program.clone()],
+        &system_instruction::transfer(vault_account.key, donor.key, refund_amount),
+        &[vault_account.clone(), donor.clone(), sys_program.clone()],
         &[&[b"vault", campaign_account.key.as_ref(), &[bump]]],
     )?;
 
-    msg!("Refunded: {} lamports to {}", amount, donor.key);
+    // Zero out the contribution to prevent double-refund.
+    // Close the account: transfer rent back to donor, zero data.
+    let contrib_lamports = **contrib_account.lamports.borrow();
+    **contrib_account.lamports.borrow_mut() = 0;
+    **donor.lamports.borrow_mut() = donor.lamports()
+        .checked_add(contrib_lamports)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    // Zero the data so it can't be deserialized again
+    let mut data = contrib_account.data.borrow_mut();
+    for byte in data.iter_mut() {
+        *byte = 0;
+    }
 
+    msg!("Refunded: {} lamports to {}", refund_amount, donor.key);
     Ok(())
 }
