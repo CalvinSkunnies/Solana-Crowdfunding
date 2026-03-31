@@ -3,7 +3,7 @@
  * 
  * This client demonstrates how to interact with the crowdfunding smart contract.
  * 
- * Program ID: CrwdN8ruKmWC3uxRWD9LU1RqoT4V3WQ3iRCJ5rRDxS3q
+ * Program ID: DKsRhfniEEv3EcNgvbid11aDAAC3Mbsxui3rTQnU5GS3
  * 
  * Instructions:
  * 1. Install dependencies: npm install @solana/web3.js @solana/anchor
