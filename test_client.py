@@ -1,5 +1,31 @@
 """
-I think still no PDA vault here (will be updated next)
+Solana Crowdfunding Platform — Python Test Client
+Devnet · PDA Vault edition
+
+Usage:
+    pip install solders solana
+
+    python test_client.py                           # use ~/.config/solana/id.json
+    python test_client.py --keypair /path/id.json   # explicit keypair
+    python test_client.py --new-wallet              # throwaway keypair + auto-airdrop
+    python test_client.py --scenario success        # run one scenario
+    python test_client.py --scenario refund
+    python test_client.py --scenario all            # default
+
+Architecture
+────────────
+Each campaign has TWO accounts:
+
+  campaign account  (owned by the program, holds Campaign state / raised counter)
+  vault PDA         (seeds: ["vault", campaign_pubkey], system-owned, holds all SOL)
+
+Donations go into the vault PDA — never into the campaign account directly.
+The program signs vault transfers with invoke_signed using the bump stored in
+Campaign.bump.
+
+Rebuild & redeploy after editing lib.rs:
+    cargo build-sbf
+    solana program deploy target/deploy/solana_crowdfunding.so --url devnet
 """
 
 import argparse
@@ -10,7 +36,7 @@ import struct
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -28,69 +54,50 @@ from solana.rpc.types import TxOpts
 # Configuration
 # =============================================================================
 
-PROGRAM_ID       = Pubkey.from_string("DKsRhfniEEv3EcNgvbid11aDAAC3Mbsxui3rTQnU5GS3")
-RPC_URL          = "https://api.devnet.solana.com"
-RENT_SYSVAR      = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
-LAMPORTS_PER_SOL = 1_000_000_000
+PROGRAM_ID        = Pubkey.from_string("DKsRhfniEEv3EcNgvbid11aDAAC3Mbsxui3rTQnU5GS3")
+RPC_URL           = "https://api.devnet.solana.com"
+RENT_SYSVAR       = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
+LAMPORTS_PER_SOL  = 1_000_000_000
 
-GOAL_SOL      = 0.1
+GOAL_SOL      = 0.10
 CONTRIB_1_SOL = 0.06
 CONTRIB_2_SOL = 0.05
-
-SHORT_DEADLINE  = True
-DEADLINE_OFFSET = 45   # seconds
+DEADLINE_SECS = 45   # short deadline so tests finish fast
 
 # =============================================================================
-# Result tracking
+# PDA helpers
 # =============================================================================
 
-@dataclass
-class StepResult:
-    number: int
-    label:  str
-    passed: bool
-    note:   str = ""
-
-_results: list = []
-
-def record(number: int, label: str, passed: bool, note: str = ""):
-    icon   = "✅" if passed else "❌"
-    status = "PASS" if passed else "FAIL"
-    _results.append(StepResult(number, label, passed, note))
-    print(f"  [{icon} {status}] {label}")
-    if note:
-        print(f"         → {note}")
-
-def print_summary():
-    print("\n" + "=" * 66)
-    print("TEST SUMMARY")
-    print("=" * 66)
-    for r in _results:
-        icon   = "✅" if r.passed else "❌"
-        status = "PASS" if r.passed else "FAIL"
-        print(f"  {r.number:>2}. {r.label:<44} {icon} {status}")
-        if not r.passed and r.note:
-            print(f"       → {r.note}")
-    passed = sum(1 for r in _results if r.passed)
-    total  = len(_results)
-    print("-" * 66)
-    print(f"  Result : {passed}/{total} passed")
-    print("=" * 66)
+def find_vault_pda(campaign_pubkey: Pubkey) -> tuple:
+    """
+    Derive the vault PDA — mirrors lib.rs find_vault_pda().
+    Seeds: [b"vault", campaign_pubkey]
+    Returns (Pubkey, bump: int).
+    """
+    seeds = [b"vault", bytes(campaign_pubkey)]
+    return Pubkey.find_program_address(seeds, PROGRAM_ID)
 
 # =============================================================================
 # Wallet helpers
 # =============================================================================
 
-def _default_keypair_paths():
+def _default_keypair_paths() -> List[str]:
     home = os.path.expanduser("~")
     return [
         os.path.join(home, ".config", "solana", "id.json"),
-        os.path.join(home, "solana",  "id.json"),
+        os.path.join(home, "solana", "id.json"),
         os.path.join(home, ".solana", "id.json"),
         "id.json",
     ]
 
-def load_wallet(keypair_path=None, generate_new=False) -> Keypair:
+def load_wallet(keypair_path: Optional[str] = None, generate_new: bool = False) -> Keypair:
+    """
+    Load a Keypair from (in priority order):
+      1. --keypair argument
+      2. SOLANA_KEYPAIR_PATH env var
+      3. Default Solana CLI path (OS-aware)
+      4. Generate throwaway (--new-wallet)
+    """
     if keypair_path:
         return _load_from_file(keypair_path)
     env = os.environ.get("SOLANA_KEYPAIR_PATH")
@@ -134,7 +141,7 @@ def get_client() -> Client:
     try:
         c.get_version()
     except Exception as e:
-        print(f"ERROR: Cannot reach Devnet: {e}")
+        print(f"ERROR: Cannot reach Devnet ({RPC_URL}): {e}")
         sys.exit(1)
     return c
 
@@ -142,6 +149,7 @@ def get_balance_sol(client: Client, pubkey: Pubkey) -> float:
     return client.get_balance(pubkey, commitment=Confirmed).value / LAMPORTS_PER_SOL
 
 def ensure_funded(client: Client, pubkey: Pubkey, min_sol: float = 0.5):
+    """Auto-airdrop 2 SOL if balance is below min_sol."""
     balance = get_balance_sol(client, pubkey)
     print(f"Wallet balance : {balance:.4f} SOL")
     if balance >= min_sol:
@@ -149,15 +157,15 @@ def ensure_funded(client: Client, pubkey: Pubkey, min_sol: float = 0.5):
     print(f"Balance below {min_sol} SOL — requesting 2 SOL airdrop...")
     for attempt in range(1, 4):
         try:
-            resp    = client.request_airdrop(pubkey, 2 * LAMPORTS_PER_SOL, commitment=Confirmed)
-            sig_obj = resp.value   # already a Signature object — do NOT str()
-            print(f"  Airdrop tx: {sig_obj}")
+            resp = client.request_airdrop(pubkey, 2 * LAMPORTS_PER_SOL, commitment=Confirmed)
+            sig  = resp.value
+            print(f"  Airdrop TX: {sig}")
             for _ in range(45):
                 time.sleep(1)
-                st = client.get_signature_statuses([sig_obj]).value[0]
+                st = client.get_signature_statuses([sig]).value[0]
                 if st and st.confirmation_status:
-                    bal = get_balance_sol(client, pubkey)
-                    print(f"  Airdrop confirmed! New balance: {bal:.4f} SOL")
+                    balance = get_balance_sol(client, pubkey)
+                    print(f"  Confirmed! New balance: {balance:.4f} SOL")
                     return
         except Exception as e:
             print(f"  Attempt {attempt} failed: {e}")
@@ -165,91 +173,16 @@ def ensure_funded(client: Client, pubkey: Pubkey, min_sol: float = 0.5):
     print("WARNING: Airdrop failed. Run: solana airdrop 2 --url devnet")
 
 # =============================================================================
-# Instruction builders — exact account layouts from lib.rs
-#
-# CreateCampaign: creator(signer,w), campaign(signer,w), system_program, rent
-# Contribute:     donor(signer,w),   campaign(w),         system_program
-# Withdraw:       creator(signer,w), campaign(w)
-# Refund:         donor(signer,w),   campaign(w)
-#
-# NOTE: The campaign account IS the fund storage. There is no separate vault
-# PDA account passed to any instruction — the program transfers SOL directly
-# into and out of the campaign account.
-# =============================================================================
-
-def ix_create_campaign(creator: Pubkey, campaign: Pubkey,
-                        goal: int, deadline: int) -> Instruction:
-    """[0x00] | goal u64 LE (8 bytes) | deadline i64 LE (8 bytes)"""
-    data = bytes([0]) + struct.pack("<Q", goal) + struct.pack("<q", deadline)
-    return Instruction(
-        program_id=PROGRAM_ID,
-        accounts=[
-            AccountMeta(pubkey=creator,           is_signer=True,  is_writable=True),
-            AccountMeta(pubkey=campaign,           is_signer=True,  is_writable=True),
-            AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
-            AccountMeta(pubkey=RENT_SYSVAR,       is_signer=False, is_writable=False),
-        ],
-        data=data,
-    )
-
-def ix_contribute(donor: Pubkey, campaign: Pubkey, amount: int) -> Instruction:
-    """
-    [0x01] | amount u64 LE (8 bytes)
-    3 accounts: donor, campaign, system_program
-    SOL is transferred directly into the campaign account (no separate vault).
-    """
-    data = bytes([1]) + struct.pack("<Q", amount)
-    return Instruction(
-        program_id=PROGRAM_ID,
-        accounts=[
-            AccountMeta(pubkey=donor,             is_signer=True,  is_writable=True),
-            AccountMeta(pubkey=campaign,           is_signer=False, is_writable=True),
-            AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
-        ],
-        data=data,
-    )
-
-def ix_withdraw(creator: Pubkey, campaign: Pubkey) -> Instruction:
-    """
-    [0x02]  (no payload)
-    2 accounts: creator, campaign
-    Program drains campaign lamports → creator using direct lamport manipulation.
-    """
-    return Instruction(
-        program_id=PROGRAM_ID,
-        accounts=[
-            AccountMeta(pubkey=creator,  is_signer=True,  is_writable=True),
-            AccountMeta(pubkey=campaign, is_signer=False, is_writable=True),
-        ],
-        data=bytes([2]),
-    )
-
-def ix_refund(donor: Pubkey, campaign: Pubkey, amount: int) -> Instruction:
-    """
-    [0x03] | amount u64 LE (8 bytes)
-    2 accounts: donor, campaign
-    """
-    data = bytes([3]) + struct.pack("<Q", amount)
-    return Instruction(
-        program_id=PROGRAM_ID,
-        accounts=[
-            AccountMeta(pubkey=donor,    is_signer=True,  is_writable=True),
-            AccountMeta(pubkey=campaign, is_signer=False, is_writable=True),
-        ],
-        data=data,
-    )
-
-# =============================================================================
 # Transaction helpers
 # =============================================================================
 
-def send_tx(client: Client, instructions: list, signers: list,
-            label: str = "tx") -> Optional[Signature]:
-    """
-    Build + sign + send a VersionedTransaction (MessageV0).
-    Returns a Signature object (NOT a str) — required by get_signature_statuses.
-    Prints full program logs on failure.
-    """
+def send_tx(
+    client: Client,
+    instructions: List[Instruction],
+    signers: List[Keypair],
+    label: str = "tx",
+) -> Optional[Signature]:
+    """Build, sign and send a VersionedTransaction. Returns Signature or None."""
     try:
         bh  = client.get_latest_blockhash(commitment=Confirmed).value.blockhash
         msg = MessageV0.try_compile(
@@ -261,33 +194,21 @@ def send_tx(client: Client, instructions: list, signers: list,
         tx   = VersionedTransaction(msg, signers)
         opts = TxOpts(skip_preflight=False, preflight_commitment=Confirmed)
         resp = client.send_transaction(tx, opts=opts)
-        sig  = resp.value   # Signature object — do NOT str() it before storing
-        print(f"  [{label}] Sig     : {sig}")
-        print(f"  [{label}] Explorer: https://explorer.solana.com/tx/{sig}?cluster=devnet")
+        sig  = resp.value
+        print(f"  [{label}] sig      : {sig}")
+        print(f"  [{label}] explorer : https://explorer.solana.com/tx/{sig}?cluster=devnet")
         return sig
     except Exception as e:
-        err_str = str(e)
-        print(f"  [{label}] FAILED  : {err_str[:300]}")
-        # Extract program log lines for readable on-chain errors
-        try:
-            logs = re.findall(r'"Program log: (.*?)"', err_str)
-            if logs:
-                print(f"  [{label}] Program logs:")
-                for line in logs:
-                    print(f"    >> {line}")
-            else:
-                # Fall back to printing the full error so nothing is hidden
-                print(f"  [{label}] Full error:\n    {err_str}")
-        except Exception:
-            pass
+        err = str(e)
+        print(f"  [{label}] FAILED   : {err[:400]}")
+        logs = re.findall(r'"Program log: (.*?)"', err)
+        if logs:
+            print(f"  [{label}] program logs:")
+            for line in logs:
+                print(f"    >> {line}")
         return None
 
-def wait_confirm(client: Client, sig: Optional[Signature],
-                 timeout: int = 60) -> bool:
-    """
-    Poll for confirmation. sig must be a Signature object (not str).
-    confirmation_status is a solders enum — use str().lower() to compare.
-    """
+def wait_confirm(client: Client, sig: Optional[Signature], timeout: int = 60) -> bool:
     if not sig:
         return False
     for i in range(timeout):
@@ -295,326 +216,387 @@ def wait_confirm(client: Client, sig: Optional[Signature],
         try:
             status = client.get_signature_statuses([sig]).value[0]
             if status is not None:
-                cs = str(status.confirmation_status).lower() \
-                     if status.confirmation_status else ""
+                cs = str(status.confirmation_status).lower() if status.confirmation_status else ""
                 if "confirmed" in cs or "finalized" in cs:
                     return True
-        except Exception as e:
-            if i % 15 == 0:
-                print(f"  Polling ({i}s) ... ({e})")
+        except Exception:
+            pass
     print(f"  WARNING: Timed out after {timeout}s")
     return False
 
-def check_tx_status(client: Client, sig: Optional[Signature]):
-    """Fetch full TX record — use when wait_confirm times out."""
-    if not sig:
-        return
-    print(f"  On-chain check: {sig}")
-    try:
-        result = client.get_transaction(
-            sig,
-            max_supported_transaction_version=0,
-            commitment=Confirmed,
-        )
-        if result.value is None:
-            print("  Not found — may still be processing.")
-            return
-        meta = result.value.transaction.meta
-        if meta is None:
-            print("  TX found but metadata unavailable.")
-            return
-        if meta.err:
-            print(f"  TX FAILED on-chain: {meta.err}")
-        else:
-            print(f"  TX confirmed ✓  (fee: {meta.fee} lamports)")
-        if meta.log_messages:
-            print("  Program logs:")
-            for line in meta.log_messages:
-                print(f"    >> {line}")
-    except Exception as e:
-        print(f"  Status check error: {e}")
-
-def send_and_confirm(client: Client, instructions: list, signers: list,
-                     label: str) -> bool:
+def send_and_confirm(client, instructions, signers, label) -> bool:
     sig = send_tx(client, instructions, signers, label)
     if sig is None:
         return False
-    ok = wait_confirm(client, sig)
-    if not ok:
-        print(f"  Polling timed out — fetching on-chain status...")
-        check_tx_status(client, sig)
-        time.sleep(8)
-        check_tx_status(client, sig)
-    return ok
+    return wait_confirm(client, sig)
 
 # =============================================================================
-# Checklist
+# Instruction builders
+#
+# All instructions now include the vault PDA as an explicit account.
+# vault = find_vault_pda(campaign_pubkey)[0]   ← compute this before calling
+#
+# Instruction | Accounts (in order)
+# ------------|---------------------------------------------------
+# create      | creator(sw), campaign(sw), vault(w), system, rent
+# contribute  | donor(sw),   campaign(w),  vault(w), system
+# withdraw    | creator(sw), campaign(w),  vault(w), system
+# refund      | donor(sw),   campaign(w),  vault(w), system
 # =============================================================================
 
-def run_checklist(client: Client, wallet: Keypair):
+def ix_create_campaign(
+    creator: Pubkey, campaign: Pubkey, vault: Pubkey,
+    goal: int, deadline: int,
+) -> Instruction:
+    """[0x00] | goal(u64 LE) | deadline(i64 LE)"""
+    data = bytes([0]) + struct.pack("<Q", goal) + struct.pack("<q", deadline)
+    return Instruction(
+        program_id=PROGRAM_ID,
+        accounts=[
+            AccountMeta(pubkey=creator,           is_signer=True,  is_writable=True),
+            AccountMeta(pubkey=campaign,           is_signer=True,  is_writable=True),
+            AccountMeta(pubkey=vault,              is_signer=False, is_writable=True),
+            AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=RENT_SYSVAR,        is_signer=False, is_writable=False),
+        ],
+        data=data,
+    )
+
+def ix_contribute(
+    donor: Pubkey, campaign: Pubkey, vault: Pubkey, amount: int,
+) -> Instruction:
+    """[0x01] | amount(u64 LE) — SOL goes into vault PDA, NOT campaign account"""
+    data = bytes([1]) + struct.pack("<Q", amount)
+    return Instruction(
+        program_id=PROGRAM_ID,
+        accounts=[
+            AccountMeta(pubkey=donor,             is_signer=True,  is_writable=True),
+            AccountMeta(pubkey=campaign,           is_signer=False, is_writable=True),
+            AccountMeta(pubkey=vault,              is_signer=False, is_writable=True),
+            AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+        ],
+        data=data,
+    )
+
+def ix_withdraw(
+    creator: Pubkey, campaign: Pubkey, vault: Pubkey,
+) -> Instruction:
+    """[0x02] — drains vault → creator via invoke_signed"""
+    return Instruction(
+        program_id=PROGRAM_ID,
+        accounts=[
+            AccountMeta(pubkey=creator,           is_signer=True,  is_writable=True),
+            AccountMeta(pubkey=campaign,           is_signer=False, is_writable=True),
+            AccountMeta(pubkey=vault,              is_signer=False, is_writable=True),
+            AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+        ],
+        data=bytes([2]),
+    )
+
+def ix_refund(
+    donor: Pubkey, campaign: Pubkey, vault: Pubkey, amount: int,
+) -> Instruction:
+    """[0x03] | amount(u64 LE) — vault → donor via invoke_signed"""
+    data = bytes([3]) + struct.pack("<Q", amount)
+    return Instruction(
+        program_id=PROGRAM_ID,
+        accounts=[
+            AccountMeta(pubkey=donor,             is_signer=True,  is_writable=True),
+            AccountMeta(pubkey=campaign,           is_signer=False, is_writable=True),
+            AccountMeta(pubkey=vault,              is_signer=False, is_writable=True),
+            AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+        ],
+        data=data,
+    )
+
+# =============================================================================
+# Result tracking
+# =============================================================================
+
+@dataclass
+class StepResult:
+    number: int
+    label:  str
+    passed: bool
+    note:   str = ""
+
+_results: list = []
+
+def record(number: int, label: str, passed: bool, note: str = ""):
+    icon   = "✅" if passed else "❌"
+    status = "PASS" if passed else "FAIL"
+    _results.append(StepResult(number, label, passed, note))
+    print(f"  [{icon} {status}] {label}")
+    if note:
+        print(f"         → {note}")
+
+def print_summary():
     print("\n" + "=" * 66)
-    print("CROWDFUNDING TEST CHECKLIST")
+    print("TEST SUMMARY")
+    print("=" * 66)
+    for r in _results:
+        icon   = "✅" if r.passed else "❌"
+        status = "PASS" if r.passed else "FAIL"
+        print(f"  {r.number:>2}. {r.label:<44} {icon} {status}")
+        if not r.passed and r.note:
+            print(f"       → {r.note}")
+    passed = sum(1 for r in _results if r.passed)
+    total  = len(_results)
+    print("-" * 66)
+    print(f"  Result : {passed}/{total} passed")
     print("=" * 66)
 
-    campaign_kp = Keypair()
+# =============================================================================
+# Scenario 1 — goal reached → withdraw
+# =============================================================================
 
-    goal_lamps     = int(GOAL_SOL      * LAMPORTS_PER_SOL)  # 100_000_000
-    contrib1_lamps = int(CONTRIB_1_SOL * LAMPORTS_PER_SOL)  #  60_000_000
-    contrib2_lamps = int(CONTRIB_2_SOL * LAMPORTS_PER_SOL)  #  50_000_000
+def run_success_scenario(client: Client, wallet: Keypair):
+    print("\n" + "=" * 66)
+    print("SCENARIO 1: Goal Reached → Withdraw")
+    print("=" * 66)
 
-    if SHORT_DEADLINE:
-        deadline      = int(time.time()) + DEADLINE_OFFSET
-        deadline_desc = f"~{DEADLINE_OFFSET}s from now"
-    else:
-        deadline      = int(time.time()) + 86_400
-        deadline_desc = "24 hours from now"
+    campaign_kp  = Keypair()
+    campaign_pub = campaign_kp.pubkey()
+    vault_pub, _ = find_vault_pda(campaign_pub)
 
-    creator_pubkey  = wallet.pubkey()
-    campaign_pubkey = campaign_kp.pubkey()
+    goal_lamps     = int(GOAL_SOL      * LAMPORTS_PER_SOL)
+    contrib1_lamps = int(CONTRIB_1_SOL * LAMPORTS_PER_SOL)
+    contrib2_lamps = int(CONTRIB_2_SOL * LAMPORTS_PER_SOL)
+    deadline       = int(time.time()) + DEADLINE_SECS
+    creator_pub    = wallet.pubkey()
 
-    print(f"\n  Creator  : {creator_pubkey}")
-    print(f"  Campaign : {campaign_pubkey}  ← also acts as the fund vault")
-    print(f"  Goal     : {GOAL_SOL} SOL  ({goal_lamps:,} lamports)")
-    print(f"  Contrib1 : {CONTRIB_1_SOL} SOL  →  raised = {CONTRIB_1_SOL}")
-    print(f"  Contrib2 : {CONTRIB_2_SOL} SOL  →  raised = "
-          f"{round(CONTRIB_1_SOL + CONTRIB_2_SOL, 2)}")
-    print(f"  Deadline : {deadline_desc}")
+    print(f"\n  Creator  : {creator_pub}")
+    print(f"  Campaign : {campaign_pub}   ← state account")
+    print(f"  Vault PDA: {vault_pub}   ← SOL stored here")
+    print(f"  Goal     : {GOAL_SOL} SOL")
+    print(f"  Deadline : ~{DEADLINE_SECS}s from now")
 
-    # ── STEP 1: Create campaign ───────────────────────────────────────────────
-    print("\n" + "─" * 66)
-    print(f"STEP 1 — Create campaign  (goal={GOAL_SOL} SOL)")
-    print("─" * 66)
-
+    # Step 1 — Create
+    print("\n─── STEP 1: Create campaign")
     ok = send_and_confirm(
         client,
-        [ix_create_campaign(creator_pubkey, campaign_pubkey, goal_lamps, deadline)],
+        [ix_create_campaign(creator_pub, campaign_pub, vault_pub, goal_lamps, deadline)],
         [wallet, campaign_kp],
         "create_campaign",
     )
-    record(1, "Create campaign", ok,
-           "" if ok else "TX not confirmed — paste Explorer link into browser")
+    record(1, f"Create campaign (goal={GOAL_SOL} SOL)", ok)
     if not ok:
-        print("\n  Cannot continue. Aborting.")
-        print_summary()
         return
 
-    # ── STEP 2: Contribute 0.06 SOL ──────────────────────────────────────────
-    print("\n" + "─" * 66)
-    print(f"STEP 2 — Contribute {CONTRIB_1_SOL} SOL  →  raised = {CONTRIB_1_SOL} SOL")
-    print("─" * 66)
+    vault_rent_bal = get_balance_sol(client, vault_pub)
+    print(f"\n  Vault balance after create: {vault_rent_bal:.6f} SOL (rent-exempt minimum)")
 
-    camp_before_2  = get_balance_sol(client, campaign_pubkey)
-    wallet_before_2 = get_balance_sol(client, creator_pubkey)
-
+    # Step 2 — Contribute 0.06
+    print(f"\n─── STEP 2: Contribute {CONTRIB_1_SOL} SOL → vault")
+    vault_before = get_balance_sol(client, vault_pub)
     ok = send_and_confirm(
         client,
-        [ix_contribute(creator_pubkey, campaign_pubkey, contrib1_lamps)],
-        [wallet],
-        "contribute_0.06",
+        [ix_contribute(creator_pub, campaign_pub, vault_pub, contrib1_lamps)],
+        [wallet], "contribute_1",
     )
+    vault_after = get_balance_sol(client, vault_pub)
+    delta = vault_after - vault_before
+    print(f"\n  Vault: {vault_before:.6f} → {vault_after:.6f} SOL  (+{delta:.6f})")
+    record(2, f"Contribute {CONTRIB_1_SOL} SOL → vault received funds",
+           ok and delta >= CONTRIB_1_SOL * 0.99)
 
-    camp_after_2   = get_balance_sol(client, campaign_pubkey)
-    wallet_after_2 = get_balance_sol(client, creator_pubkey)
-    camp_delta_2   = camp_after_2  - camp_before_2
-    wallet_delta_2 = wallet_before_2 - wallet_after_2
-
-    print(f"\n  Campaign balance : {camp_before_2:.6f} → {camp_after_2:.6f}  "
-          f"(+{camp_delta_2:.6f} SOL)")
-    print(f"  Wallet balance   : {wallet_before_2:.6f} → {wallet_after_2:.6f}  "
-          f"(-{wallet_delta_2:.6f} SOL incl fee)")
-
-    funds_received_2 = camp_delta_2 > 0
-    record(2, f"Contribute {CONTRIB_1_SOL} SOL → raised={CONTRIB_1_SOL} SOL",
-           ok and funds_received_2,
-           "" if (ok and funds_received_2) else
-           ("TX failed" if not ok else
-            "Campaign balance unchanged — check account layout"))
-
-    # ── STEP 3: Contribute 0.05 SOL → raised = 0.11 SOL ──────────────────────
-    print("\n" + "─" * 66)
-    print(f"STEP 3 — Contribute {CONTRIB_2_SOL} SOL  →  raised = "
-          f"{round(CONTRIB_1_SOL + CONTRIB_2_SOL, 2)} SOL  (exceeds goal)")
-    print("─" * 66)
-
-    camp_before_3 = get_balance_sol(client, campaign_pubkey)
-
+    # Step 3 — Contribute 0.05 (total 0.11 > goal)
+    print(f"\n─── STEP 3: Contribute {CONTRIB_2_SOL} SOL (total > goal)")
+    vault_before = get_balance_sol(client, vault_pub)
     ok = send_and_confirm(
         client,
-        [ix_contribute(creator_pubkey, campaign_pubkey, contrib2_lamps)],
-        [wallet],
-        "contribute_0.05",
+        [ix_contribute(creator_pub, campaign_pub, vault_pub, contrib2_lamps)],
+        [wallet], "contribute_2",
     )
+    vault_after = get_balance_sol(client, vault_pub)
+    delta = vault_after - vault_before
+    print(f"\n  Vault: {vault_before:.6f} → {vault_after:.6f} SOL  (+{delta:.6f})")
+    record(3, f"Contribute {CONTRIB_2_SOL} SOL → vault > goal",
+           ok and delta >= CONTRIB_2_SOL * 0.99)
 
-    camp_after_3  = get_balance_sol(client, campaign_pubkey)
-    camp_delta_3  = camp_after_3 - camp_before_3
-
-    print(f"\n  Campaign balance : {camp_before_3:.6f} → {camp_after_3:.6f}  "
-          f"(+{camp_delta_3:.6f} SOL)")
-
-    funds_received_3 = camp_delta_3 > 0
-    record(3, f"Contribute {CONTRIB_2_SOL} SOL → raised="
-               f"{round(CONTRIB_1_SOL + CONTRIB_2_SOL, 2)} SOL",
-           ok and funds_received_3,
-           "" if (ok and funds_received_3) else
-           ("TX failed" if not ok else "Campaign balance unchanged"))
-
-    # ── STEP 4: Withdraw BEFORE deadline → must FAIL ──────────────────────────
-    print("\n" + "─" * 66)
-    print("STEP 4 — Withdraw BEFORE deadline  →  must FAIL  (CampaignActive)")
-    print("─" * 66)
+    # Step 4 — Early withdraw (must fail)
+    print("\n─── STEP 4: Withdraw before deadline (expect: FAIL)")
     secs = max(0, deadline - int(time.time()))
-    print(f"  {secs}s until deadline — program should reject with CampaignActive")
-
-    sig_early = send_tx(
-        client,
-        [ix_withdraw(creator_pubkey, campaign_pubkey)],
-        [wallet],
-        "early_withdraw",
-    )
-
+    print(f"  {secs}s until deadline — program must reject")
+    sig_early = send_tx(client, [ix_withdraw(creator_pub, campaign_pub, vault_pub)],
+                        [wallet], "early_withdraw")
     if sig_early is None:
-        # send_tx returned None = preflight rejected it = correct
-        record(4, "Withdraw before deadline → rejected ✓", True,
-               "Correctly rejected at preflight")
+        record(4, "Withdraw before deadline → rejected ✓", True, "Rejected at preflight")
     else:
         early_ok = wait_confirm(client, sig_early, timeout=20)
-        if early_ok:
-            record(4, "Withdraw before deadline → rejected ✓", False,
-                   "⚠️  Program ALLOWED early withdrawal — deadline check missing!")
-        else:
-            record(4, "Withdraw before deadline → rejected ✓", True,
-                   "Correctly rejected by validator")
+        record(4, "Withdraw before deadline → rejected ✓", not early_ok,
+               "Correctly rejected" if not early_ok else
+               "⚠️  Program allowed early withdrawal!")
 
-    # ── STEP 5: Wait for deadline, then withdraw → must SUCCEED ───────────────
-    print("\n" + "─" * 66)
-    print("STEP 5 — Wait for deadline, then withdraw  →  must SUCCEED")
-    print("─" * 66)
-
+    # Step 5 — Wait, then withdraw (must succeed)
+    print("\n─── STEP 5: Wait for deadline then withdraw (expect: SUCCESS)")
     remaining = deadline - int(time.time())
     if remaining > 0:
-        wait_secs = remaining + 3
-        print(f"  Waiting {wait_secs}s for deadline to pass...")
-        for t in range(wait_secs, 0, -1):
-            print(f"  ⏳ {t:>3}s remaining...", end="\r")
+        wait = remaining + 3
+        print(f"  Waiting {wait}s...")
+        for t in range(wait, 0, -1):
+            print(f"  ⏳ {t:>3}s ...", end="\r")
             time.sleep(1)
         print()
-    else:
-        print("  Deadline already passed.")
 
-    wallet_pre_w  = get_balance_sol(client, creator_pubkey)
-    camp_pre_w    = get_balance_sol(client, campaign_pubkey)
-
+    vault_pre   = get_balance_sol(client, vault_pub)
+    creator_pre = get_balance_sol(client, creator_pub)
     ok = send_and_confirm(
         client,
-        [ix_withdraw(creator_pubkey, campaign_pubkey)],
-        [wallet],
-        "withdraw",
+        [ix_withdraw(creator_pub, campaign_pub, vault_pub)],
+        [wallet], "withdraw",
     )
+    vault_post   = get_balance_sol(client, vault_pub)
+    creator_post = get_balance_sol(client, creator_pub)
+    print(f"\n  Vault   : {vault_pre:.6f} → {vault_post:.6f} SOL ({vault_post-vault_pre:+.6f})")
+    print(f"  Creator : {creator_pre:.6f} → {creator_post:.6f} SOL ({creator_post-creator_pre:+.6f})")
+    record(5, "Withdraw after deadline → success", ok and vault_post < vault_pre)
 
-    wallet_post_w = get_balance_sol(client, creator_pubkey)
-    camp_post_w   = get_balance_sol(client, campaign_pubkey)
-    wallet_net    = wallet_post_w - wallet_pre_w
-    camp_net      = camp_post_w  - camp_pre_w
-
-    print(f"  Wallet   : {wallet_pre_w:.6f} → {wallet_post_w:.6f}  "
-          f"({wallet_net:+.6f} SOL)")
-    print(f"  Campaign : {camp_pre_w:.6f} → {camp_post_w:.6f}  "
-          f"({camp_net:+.6f} SOL)")
-
-    record(5, "Withdraw after deadline → success", ok,
-           "" if ok else "Withdraw TX failed — check program logs above")
-
-    # ── STEP 6: Withdraw again → must FAIL (AlreadyClaimed) ───────────────────
-    print("\n" + "─" * 66)
-    print("STEP 6 — Withdraw again  →  must FAIL  (AlreadyClaimed)")
-    print("─" * 66)
-
-    sig_double = send_tx(
-        client,
-        [ix_withdraw(creator_pubkey, campaign_pubkey)],
-        [wallet],
-        "double_withdraw",
-    )
-
+    # Step 6 — Double-withdraw (must fail)
+    print("\n─── STEP 6: Double-withdraw (expect: FAIL — AlreadyClaimed)")
+    sig_double = send_tx(client, [ix_withdraw(creator_pub, campaign_pub, vault_pub)],
+                         [wallet], "double_withdraw")
     if sig_double is None:
-        record(6, "Double withdraw → rejected ✓  (AlreadyClaimed)", True,
-               "Correctly rejected at preflight")
+        record(6, "Double-withdraw → rejected ✓", True, "Rejected at preflight")
     else:
         double_ok = wait_confirm(client, sig_double, timeout=20)
-        if double_ok:
-            record(6, "Double withdraw → rejected ✓  (AlreadyClaimed)", False,
-                   "⚠️  Program ALLOWED double withdrawal — claimed flag never set!")
-        else:
-            record(6, "Double withdraw → rejected ✓  (AlreadyClaimed)", True,
-                   "Correctly rejected by validator")
+        record(6, "Double-withdraw → rejected ✓", not double_ok,
+               "Correctly rejected" if not double_ok else
+               "⚠️  Program allowed double withdrawal!")
 
-    print_summary()
+# =============================================================================
+# Scenario 2 — goal not reached → refund
+# =============================================================================
+
+def run_refund_scenario(client: Client, wallet: Keypair):
+    print("\n" + "=" * 66)
+    print("SCENARIO 2: Goal NOT Reached → Refund")
+    print("=" * 66)
+
+    campaign_kp  = Keypair()
+    campaign_pub = campaign_kp.pubkey()
+    vault_pub, _ = find_vault_pda(campaign_pub)
+
+    goal_lamps    = int(0.50 * LAMPORTS_PER_SOL)
+    contrib_lamps = int(0.05 * LAMPORTS_PER_SOL)
+    deadline      = int(time.time()) + DEADLINE_SECS
+    creator_pub   = wallet.pubkey()
+
+    print(f"\n  Creator  : {creator_pub}")
+    print(f"  Campaign : {campaign_pub}")
+    print(f"  Vault PDA: {vault_pub}")
+    print(f"  Goal     : 0.5 SOL  (we contribute only 0.05 — goal not met)")
+
+    # Create
+    print("\n─── STEP 1: Create campaign")
+    ok = send_and_confirm(
+        client,
+        [ix_create_campaign(creator_pub, campaign_pub, vault_pub, goal_lamps, deadline)],
+        [wallet, campaign_kp],
+        "create_campaign",
+    )
+    record(7, "Create campaign (goal=0.5 SOL)", ok)
+    if not ok:
+        return
+
+    # Contribute (far below goal)
+    print(f"\n─── STEP 2: Contribute 0.05 SOL")
+    ok = send_and_confirm(
+        client,
+        [ix_contribute(creator_pub, campaign_pub, vault_pub, contrib_lamps)],
+        [wallet], "contribute",
+    )
+    vault_bal = get_balance_sol(client, vault_pub)
+    print(f"\n  Vault balance: {vault_bal:.6f} SOL")
+    record(8, "Contribute 0.05 SOL → vault holds funds", ok and vault_bal > 0)
+
+    # Wait for deadline then try withdraw (must fail — goal not met)
+    print("\n─── STEP 3: Wait + withdraw (expect: FAIL — GoalNotReached)")
+    remaining = deadline - int(time.time())
+    if remaining > 0:
+        wait = remaining + 3
+        print(f"  Waiting {wait}s...")
+        for t in range(wait, 0, -1):
+            print(f"  ⏳ {t:>3}s ...", end="\r")
+            time.sleep(1)
+        print()
+    sig_wd = send_tx(client, [ix_withdraw(creator_pub, campaign_pub, vault_pub)],
+                     [wallet], "withdraw_no_goal")
+    if sig_wd is None:
+        record(9, "Withdraw with goal not met → rejected ✓", True, "Rejected at preflight")
+    else:
+        wd_ok = wait_confirm(client, sig_wd, timeout=20)
+        record(9, "Withdraw with goal not met → rejected ✓", not wd_ok,
+               "Correctly rejected" if not wd_ok else
+               "⚠️  Program allowed withdrawal despite goal not reached!")
+
+    # Refund (must succeed)
+    print(f"\n─── STEP 4: Refund 0.05 SOL (expect: SUCCESS)")
+    vault_pre   = get_balance_sol(client, vault_pub)
+    creator_pre = get_balance_sol(client, creator_pub)
+    ok = send_and_confirm(
+        client,
+        [ix_refund(creator_pub, campaign_pub, vault_pub, contrib_lamps)],
+        [wallet], "refund",
+    )
+    vault_post   = get_balance_sol(client, vault_pub)
+    creator_post = get_balance_sol(client, creator_pub)
+    print(f"\n  Vault   : {vault_pre:.6f} → {vault_post:.6f} SOL")
+    print(f"  Creator : {creator_pre:.6f} → {creator_post:.6f} SOL")
+    record(10, "Refund donor → success", ok and vault_post < vault_pre)
 
 # =============================================================================
 # CLI
 # =============================================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Solana Crowdfunding — Devnet test checklist")
-    p.add_argument("--keypair",       metavar="PATH",
-                   help="Path to Solana CLI keypair JSON (64-byte array).")
-    p.add_argument("--new-wallet",    action="store_true",
-                   help="Generate a throwaway keypair + auto-airdrop.")
-    p.add_argument("--long-deadline", action="store_true",
-                   help="Use 24h deadline instead of 45s.")
+    p = argparse.ArgumentParser(
+        description="Solana Crowdfunding — Devnet test client (PDA Vault edition)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--keypair",    metavar="PATH",
+                   help="Path to a Solana CLI keypair JSON (64-byte array).")
+    p.add_argument("--new-wallet", action="store_true",
+                   help="Generate a throwaway keypair for this run.")
+    p.add_argument("--scenario",   choices=["success", "refund", "all"], default="all",
+                   help="Scenario to run (default: all).")
     return p.parse_args()
 
 def main():
     args = parse_args()
-    global SHORT_DEADLINE
-    if args.long_deadline:
-        SHORT_DEADLINE = False
 
     print("=" * 66)
-    print("Solana Crowdfunding — Devnet Test Client")
+    print("Solana Crowdfunding — Devnet Test Client  [PDA Vault Edition]")
     print("=" * 66)
     print(f"Program    : {PROGRAM_ID}")
     print(f"RPC        : {RPC_URL}")
     print(f"TX format  : VersionedTransaction + MessageV0")
-    print(f"Deadline   : {'SHORT ~45s' if SHORT_DEADLINE else 'LONG 24h'}")
+    print(f"Vault seed : [b'vault', campaign_pubkey]")
     print()
 
     wallet = load_wallet(keypair_path=args.keypair, generate_new=args.new_wallet)
     print(f"Wallet     : {wallet.pubkey()}")
 
     client = get_client()
-    print("Devnet     : connected\n")
+    print("Devnet     : connected")
 
     ensure_funded(client, wallet.pubkey(), min_sol=0.5)
 
     balance = get_balance_sol(client, wallet.pubkey())
     if balance < 0.3:
-        print(f"ERROR: Need at least 0.3 SOL.  Current: {balance:.4f}")
+        print(f"\nERROR: Need at least 0.3 SOL.  Current: {balance:.4f}")
         print("  Run:  solana airdrop 2 --url devnet")
         sys.exit(1)
-
     print(f"Balance    : {balance:.4f} SOL  (ready)\n")
 
-    run_checklist(client, wallet)
+    if args.scenario in ("success", "all"):
+        run_success_scenario(client, wallet)
+    if args.scenario in ("refund", "all"):
+        run_refund_scenario(client, wallet)
+
+    print_summary()
     print("\nDone.")
 
 if __name__ == "__main__":
     main()
-
-# =============================================================================
-# HOW TO REDEPLOY AFTER FIXING lib.rs
-# =============================================================================
-# The fix is a one-line change in src/lib.rs:
-#
-#   OLD:  let campaign_data_len = 8 + 32 + 8 + 8 + 8 + 1 + 1;  // = 66 (WRONG)
-#   NEW:  let campaign_data_len = 32 + 8 + 8 + 8 + 1 + 1;       // = 58 (CORRECT)
-#
-# Then rebuild and redeploy:
-#
-#   cargo build-sbf
-#   solana program deploy target/deploy/solana_crowdfunding.so --url devnet
-#
-# The program ID stays the same (you're upgrading an existing deployment).
-# After deploying, run:
-#
-#   python test_client.py
