@@ -328,19 +328,31 @@ fn contribute(
     ];
 
     if contrib_account.data_len() == 0 {
-        // First-time donor — create the contribution account
+        // First-time donor — initialise contribution account (pre-fund-safe).
+        // Uses transfer + allocate + assign instead of create_account to prevent
+        // DOS if an attacker pre-funds the PDA with 1 lamport.
         let rent = Rent::get()?;
+        let required = rent.minimum_balance(Contribution::LEN);
+        let current  = contrib_account.lamports();
+
+        if current < required {
+            let deficit = required - current;
+            invoke(
+                &system_instruction::transfer(donor.key, contrib_account.key, deficit),
+                &[donor.clone(), contrib_account.clone(), sys_program.clone()],
+            )?;
+        }
         invoke_signed(
-            &system_instruction::create_account(
-                donor.key,
-                contrib_account.key,
-                rent.minimum_balance(Contribution::LEN),
-                Contribution::LEN as u64,
-                program_id,
-            ),
-            &[donor.clone(), contrib_account.clone(), sys_program.clone()],
+            &system_instruction::allocate(contrib_account.key, Contribution::LEN as u64),
+            &[contrib_account.clone(), sys_program.clone()],
             &[contrib_seeds],
         )?;
+        invoke_signed(
+            &system_instruction::assign(contrib_account.key, program_id),
+            &[contrib_account.clone(), sys_program.clone()],
+            &[contrib_seeds],
+        )?;
+
         let contribution = Contribution { donor: *donor.key, amount };
         contribution.serialize(&mut &mut contrib_account.data.borrow_mut()[..])?;
     } else {
